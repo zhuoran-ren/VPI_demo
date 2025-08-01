@@ -85,6 +85,18 @@ def animate_simulation(game, interval=100, steps=100):
 
     plt.show()
     
+    # After animation, plot the v_pass_prob history
+    plt.figure(figsize=(8, 4))
+    plt.plot(game.v_pass_prob_history, label='v_pass_prob', color='blue')
+    plt.title("Vehicle Pass Probability Over Time")
+    plt.xlabel("Time Step")
+    plt.ylabel("v_pass_prob")
+    plt.ylim(0, 1.05)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
 # draw background helpers
 def draw_road_background(ax):
     road = patches.Rectangle((0, 2), 10, 2, color='#A9A9A9', zorder=0)

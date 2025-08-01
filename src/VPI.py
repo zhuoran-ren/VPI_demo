@@ -23,7 +23,7 @@ class ChickenGame:
         # Initial positions
         self.p_x = 5.0
         # self.p_y = np.random.uniform(0.0, 2.0)
-        self.p_y = 0
+        self.p_y = 1.5
         self.v_x = 3.0
         self.v_y = 3.0
 
@@ -45,6 +45,9 @@ class ChickenGame:
 
         # Initial State
         self.state = ("before", "before")
+
+        # Historical data for visualization
+        self.v_pass_prob_history = []
 
     def get_zone(self, distance, tresh):
         """Return 'before', 'in', or 'after' based on location."""
@@ -89,13 +92,13 @@ class ChickenGame:
 
     def compute_gamma(self, pet):
         if pet <= 1.770:
-            return 8
+            return 3
         elif pet <= 4.962:
-            return 5
+            return 2
         elif pet == np.inf:
             return 0
         else:
-            return 3
+            return 1
 
     def generate_payoffs(self):
         """Compute payoff matrices for game."""
@@ -149,7 +152,9 @@ class ChickenGame:
         v_strat, p_strat = self.compute_mixed_strategy_equilibrium(vehicle_payoff, pedestrian_payoff)
 
         v_pass_prob = v_strat[0]
+        self.v_pass_prob_history.append(v_pass_prob)
         p_pass_prob = p_strat[0]
+        print(p_pass_prob)
 
         self.vv_x = v_pass_prob * self.vv_max if v_pass_prob >= 0.10 else 0
         self.vp_y = p_pass_prob * self.vp_max if p_pass_prob >= 0.15 else 0
