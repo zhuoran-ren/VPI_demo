@@ -154,7 +154,6 @@ class ChickenGame:
         v_pass_prob = v_strat[0]
         self.v_pass_prob_history.append(v_pass_prob)
         p_pass_prob = p_strat[0]
-        print(p_pass_prob)
 
         self.vv_x = v_pass_prob * self.vv_max if v_pass_prob >= 0.10 else 0
         self.vp_y = p_pass_prob * self.vp_max if p_pass_prob >= 0.15 else 0

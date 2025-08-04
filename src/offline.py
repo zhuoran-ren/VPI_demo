@@ -1,42 +1,41 @@
-import torch
-from scipy.special import softmax
+import numpy as np
+from numba import cuda, float32
+import math
+import time
 
-# Get the current device (GPU if available, otherwise CPU)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Define discretized grid values
+X_REL_GRID = np.linspace(0, 5, 21).astype(np.float32)
+Y_REL_GRID = np.linspace(-5, 0, 21).astype(np.float32)
+VEL_P_GRID = np.linspace(0, 1, 11).astype(np.float32)
+VEL_V_GRID = np.linspace(0, 1, 11).astype(np.float32)
+ACT_P_GRID = np.linspace(-0.5, 0.5, 11).astype(np.float32)
+ACT_V_GRID = np.linspace(-0.5, 0.5, 11).astype(np.float32)
 
-# Strategic planner parameters
-X_REL_GRID = torch.linspace(0, 10, 21).to(device)
-Y_REL_GRID = torch.linspace(-5, 0, 21).to(device)
-VEL_P_GRID = torch.linspace(0, 1, 11).to(device)
-VEL_V_GRID = torch.linspace(0, 2, 11).to(device)
-ACT_P_GRID = torch.linspace(-1, 1, 11).to(device)
-ACT_V_GRID = torch.linspace(-1, 1, 11).to(device)
-
-HORIZON = 5
+# Planning parameters
+HORIZON = 20
 BETA = 1.0
 dt = 0.1
-
 VEL_P_MAX = 1
 VEL_V_MAX = 2
+GAMMA = 0.6
 
-# states x actions pair: shape [21x21x11x11x11x11, 6]
-state_action_grid = torch.cartesian_prod(
-    X_REL_GRID, 
-    Y_REL_GRID,
-    VEL_P_GRID,
-    VEL_V_GRID,
-    ACT_P_GRID, 
-    ACT_V_GRID
-).to(device)
+# Custom searchsorted implementation for CUDA
+@cuda.jit(device=True)
+def searchsorted(arr, val):
+    for i in range(arr.size):
+        if arr[i] >= val:
+            return i
+    return arr.size - 1
 
-print("hahah")
+# Compute PET: predictive encounter time
+@cuda.jit(device=True)
 def compute_pet(x_rel, y_rel, v_p, v_v):
-
-    t_vehicle = x_rel / v_v if v_v > 0 else torch.inf
-    t_pedestrian = abs(y_rel) / v_p if v_p > 0 else torch.inf
-
+    t_vehicle = x_rel / v_v if v_v > 0 else 1e9
+    t_pedestrian = abs(y_rel) / v_p if v_p > 0 else 1e9
     return abs(t_pedestrian - t_vehicle)
 
+# Discrete gamma mapping based on PET value
+@cuda.jit(device=True)
 def compute_gamma(pet):
     if pet <= 1.770:
         return 3
@@ -45,190 +44,206 @@ def compute_gamma(pet):
     else:
         return 1
 
-# Reward function: combines safety and progress
-def reward(state, action):
-    x_rel, y_rel, v_p, v_v = state
-    a_p, a_v = action
-    PET = compute_pet(x_rel, y_rel, v_p, v_v)
-    gamma = compute_gamma(PET)
+@cuda.jit(device=True)
+def compute_reward(x_rel, y_rel, v_p, v_v, a_p, a_v):
+    pet = compute_pet(x_rel, y_rel, v_p, v_v)
+    gamma_val = compute_gamma(pet)
 
-    safety_p = -gamma * torch.exp(v_p)
-    safety_v = -gamma * torch.exp(v_v)
+    safety_p = -gamma_val * math.exp(v_p)
+    safety_v = -gamma_val * math.exp(v_v)
 
     comfort_p = - a_p ** 2
-    comfort_v = -a_v ** 2
+    comfort_v = - a_v ** 2
 
-    d_offset = 1
-    target_p = torch.exp(1 / (abs(y_rel) + d_offset))
-    target_v = torch.exp(1 / (abs(x_rel) + d_offset))
+    d_offset = 1.0
+    target_p = math.exp(1 / (abs(y_rel) + d_offset)) * 10
+    target_v = math.exp(1 / (abs(x_rel) + d_offset)) * 10
 
-    reward_vehicle = safety_v + comfort_v + target_v
-    reward_pedestrian = safety_p + comfort_p + target_p
-    return reward_vehicle, reward_pedestrian
+    r_p = safety_p + comfort_p + target_p
+    r_v = safety_v + comfort_v + target_v
 
-# Simplified vehicle dynamics: return the next state
-def transition(state, action):
-    x_rel, y_rel, v_p, v_v = state
-    a_p, a_v = action
+    return r_p, r_v
 
-    v_p_next = torch.clamp(v_p + a_p * dt, 0.0, VEL_P_MAX)
-    v_v_next = torch.clamp(v_v + a_v * dt, 0.0, VEL_V_MAX)
-
+@cuda.jit(device=True)
+def apply_transition(x_rel, y_rel, v_p, v_v, a_p, a_v):
+    v_p_next = min(max(v_p + a_p * dt, 0.0), VEL_P_MAX)
+    v_v_next = min(max(v_v + a_v * dt, 0.0), VEL_V_MAX)
     x_rel_next = x_rel - v_v * dt
     y_rel_next = y_rel + v_p * dt
-    
-    return (x_rel_next, y_rel_next, v_p_next, v_v_next)
+    return x_rel_next, y_rel_next, v_p_next, v_v_next
 
-def discretize(state):
+@cuda.jit(device=True)
+def discretize_state(x, y, v_p, v_v,
+                     X_REL_GRID, Y_REL_GRID, VEL_P_GRID, VEL_V_GRID):
+    di_x = searchsorted(X_REL_GRID, x)
+    di_y = searchsorted(Y_REL_GRID, y)
+    di_p = searchsorted(VEL_P_GRID, v_p)
+    di_v = searchsorted(VEL_V_GRID, v_v)
+    return di_x, di_y, di_p, di_v
+
+@cuda.jit
+def compute_value_kernel(V_next, V_out,
+                         X_REL_GRID, Y_REL_GRID, VEL_P_GRID, VEL_V_GRID,
+                         ACT_P_GRID, ACT_V_GRID):
     """
-    Discretize a continuous state into the nearest grid index in each dimension.
+    GPU kernel to compute the strategic value function for one time step using backward dynamic programming.
+
+    Parameters:
+    - V_next: [nx, ny, np, nv] float32, value function at next time step
+    - V_out: [nx, ny, np, nv] float32, output value function at current step
     """
-    x, y, v_p, v_v = state
+    idx = cuda.grid(1)
+    nx, ny, np_, nv = X_REL_GRID.size, Y_REL_GRID.size, VEL_P_GRID.size, VEL_V_GRID.size
+    total_states = nx * ny * np_ * nv
 
-    dis_x_rel = torch.searchsorted(X_REL_GRID, x, side="left")
-    dis_y_rel = torch.searchsorted(Y_REL_GRID, y, side="left")
-    dis_v_p = torch.searchsorted(VEL_P_GRID, v_p, side="left")
-    dis_v_v = torch.searchsorted(VEL_V_GRID, v_v, side="left")
+    if idx >= total_states:
+        return
 
-    return (dis_x_rel, dis_y_rel, dis_v_p, dis_v_v)
+    # Unpack 4D index from flat idx
+    i_x = idx // (ny * np_ * nv)
+    i_y = (idx // (np_ * nv)) % ny
+    i_p = (idx // nv) % np_
+    i_v = idx % nv
 
-def softmax(q_values):
-    """
-    Compute a softmax distribution over a list of Q-values.
-    This is used to model the pedestrian's stochastic response.
-    """
-    q_values = torch.tensor(q_values)
-    q_values -= torch.max(q_values)
+    x_rel = X_REL_GRID[i_x]
+    y_rel = Y_REL_GRID[i_y]
+    v_p = VEL_P_GRID[i_p]
+    v_v = VEL_V_GRID[i_v]
 
-    exp_q = torch.exp(BETA * q_values)
-    probs = exp_q / torch.sum(exp_q)
+    best_q = -1e10
 
-    return probs
+    for i_av in range(ACT_V_GRID.size):
+        a_v = ACT_V_GRID[i_av]
+        q_p_list = cuda.local.array(121, dtype=float32)
+        q_v_list = cuda.local.array(121, dtype=float32)
+        count = 0
 
-def compute_q(state_grid, ):
-    pass
-def compute_strategic_value_cpu(GAMMA=0.6):
-    """
-    Compute the Stackelberg strategic value function using backward dynamic programming.
+        for i_ap in range(ACT_P_GRID.size):
+            a_p = ACT_P_GRID[i_ap]
 
-    Returns:
-    - V: dict mapping (x_rel, y_rel, v_p, v_v) to a float value.
-    """
-    
-    # Initialize V tensor with appropriate size for all states
-    V = torch.zeros((len(X_REL_GRID), len(Y_REL_GRID), len(VEL_P_GRID), len(VEL_V_GRID)), device=device)
+            # --- Step 1: reward calculation ---
+            r_p, r_v = compute_reward(x_rel, y_rel, v_p, v_v, a_p, a_v)
 
-    # Backward dynamic programming
-    for t in reversed(range(HORIZON)):
-        print(f"Backward step {t} / {HORIZON}")
+            # --- Step 2: apply dynamics ---
+            x_rel_next, y_rel_next, v_p_next, v_v_next = apply_transition(
+                x_rel, y_rel, v_p, v_v, a_p, a_v
+            )
 
-        for i_x, x_rel in enumerate(X_REL_GRID):
-            for i_y, y_rel in enumerate(Y_REL_GRID):
-                for i_p, v_p in enumerate(VEL_P_GRID):
-                    for i_v, v_v in enumerate(VEL_V_GRID):
+            # --- Step 3: discretize next state ---
+            di_x, di_y, di_p, di_v = discretize_state(
+                x_rel_next, y_rel_next, v_p_next, v_v_next,
+                X_REL_GRID, Y_REL_GRID, VEL_P_GRID, VEL_V_GRID
+            )
 
-                        state = (x_rel, y_rel, v_p, v_v)
-                        best_q = -torch.inf
+            v_next = V_next[di_x, di_y, di_p, di_v]
 
-                        for a_v in ACT_V_GRID:
-                            Q_p_list = []
-                            Q_v_list = []
+            q_p = r_p + GAMMA * v_next
+            q_v = r_v + GAMMA * v_next
 
-                            for a_p in ACT_P_GRID:
-                                action = (a_p, a_v)
+            q_p_list[count] = q_p
+            q_v_list[count] = q_v
+            count += 1
 
-                                # Get reward and transition
-                                r_v, r_p = reward(state, action)
-                                next_state = transition(state, action)
-                                next_idx = discretize(next_state)
+        # Softmax over Q_p
+        max_qp = -1e10
+        for i in range(count):
+            if q_p_list[i] > max_qp:
+                max_qp = q_p_list[i]
 
-                                # Lookup next state value
-                                v_next = V[next_idx]
+        sum_exp = 0.0
+        for i in range(count):
+            q_p_list[i] = math.exp((q_p_list[i] - max_qp) * BETA)
+            sum_exp += q_p_list[i]
 
-                                Q_p = r_p + GAMMA * v_next
-                                Q_v = r_v + GAMMA * v_next
-                                Q_p_list.append(Q_p)
-                                Q_v_list.append(Q_v)
+        expected_q = 0.0
+        for i in range(count):
+            prob = q_p_list[i] / sum_exp
+            expected_q += prob * q_v_list[i]
 
-                            p_probs = softmax(Q_p_list)
+        if expected_q > best_q:
+            best_q = expected_q
 
-                            expected_q = torch.sum(torch.tensor([p*q for p, q in zip(p_probs, Q_v_list)], device=device))
-
-                            if expected_q > best_q:
-                                best_q = expected_q
-
-                        V[i_x, i_y, i_p, i_v] = best_q
-    return V
-
-def compute_strategic_value_cuda(GAMMA=0.6):
-    """
-    Compute the Stackelberg strategic value function using backward dynamic programming.
-
-    Returns:
-    - V: dict mapping (x_rel, y_rel, v_p, v_v) to a float value.
-    """
-    # Initialize V tensor with appropriate size for all states
-    V = torch.zeros((len(X_REL_GRID), len(Y_REL_GRID), len(VEL_P_GRID), len(VEL_V_GRID)), device=device)
-
-    # Backward dynamic programming - vectorized approach
-    for t in reversed(range(HORIZON)):
-        print(f"Backward step {t} / {HORIZON}")
-
-        # Generate all possible actions as a tensor
-        actions = torch.cartesian_prod(ACT_P_GRID, ACT_V_GRID).to(device)
-
-        # Prepare tensor for all state combinations
-        states = torch.cartesian_prod(X_REL_GRID, Y_REL_GRID, VEL_P_GRID, VEL_V_GRID).to(device)
-
-        # Compute rewards for all states and actions at once
-        rewards = torch.stack([reward(state, action) for state in states for action in actions], dim=0).to(device)
-        
-        # Transition and discretize for all states and actions
-        next_states = [transition(state, action) for state in states for action in actions]
-        next_idx = [discretize(ns) for ns in next_states]
-
-        # Vectorized lookup in V tensor for next states
-        v_next = torch.tensor([V[idx] for idx in next_idx], device=device)
-
-        # Compute Q values for each action pair and state
-        Q_p = rewards[:, 0] + GAMMA * v_next
-        Q_v = rewards[:, 1] + GAMMA * v_next
-
-        # Compute softmax probabilities
-        p_probs = softmax(Q_p)
-
-        # Calculate expected Q value
-        expected_q = torch.sum(p_probs * Q_v, dim=0)
-
-        # Reshape expected Q value back into the V tensor for all states
-        V[:] = expected_q.view(len(X_REL_GRID), len(Y_REL_GRID), len(VEL_P_GRID), len(VEL_V_GRID))
-
-    return V
+    # Write best Q to output table
+    V_out[i_x, i_y, i_p, i_v] = best_q
 
 def main():
-    print("Strating strategoc value computation...")
+    # Initializa value table
+    shape = (len(X_REL_GRID), len(Y_REL_GRID), len(VEL_P_GRID), len(VEL_V_GRID))
+    V_gpu = np.zeros(shape, dtype=np.float32)
 
-    # Run backward DP
-    V = compute_strategic_value_cuda()
+    # Transfer static grids to device once (not per step)
+    d_X_REL = cuda.to_device(X_REL_GRID)
+    d_Y_REL = cuda.to_device(Y_REL_GRID)
+    d_VEL_P = cuda.to_device(VEL_P_GRID)
+    d_VEL_V = cuda.to_device(VEL_V_GRID)
+    d_ACT_P = cuda.to_device(ACT_P_GRID)
+    d_ACT_V = cuda.to_device(ACT_V_GRID)
 
-    print("Starting strategic value computation ...")
+    # Precompute kernel configuration
+    threads = 128
+    total_states = np.prod(shape)
+    blocks = (total_states + threads - 1) // threads
 
-    print("Strategic value computation complete.")
-    print(f"Total number of stored state values: {len(V)}")
+    start_time = time.time()
+    # Backward dynamic programming loop
+    for t in reversed(range(HORIZON)):
+        V_next = V_gpu.copy()
+        d_V_next = cuda.to_device(V_next)
+        d_V_out = cuda.to_device(V_gpu)
 
-    # Example: print some sampled values
-    test_state = (5.0, -2.5, 0.5, 1.0)
-    value = V.get(test_state, None)
-    if value is not None:
-        print(f"V({test_state}) = {value:.4f}")
-    else:
-        print(f"State {test_state} not found in V")
+        # Launch GPU kernel
+        compute_value_kernel[blocks, threads](
+            d_V_next, d_V_out, 
+            d_X_REL, d_Y_REL, d_VEL_P, d_VEL_V,
+            d_ACT_P, d_ACT_V
+        )
 
-    # Save to disk
-    import pickle
-    with open("strategic_value.pkl", "wb") as f:
-        pickle.dump(V, f)
-    print("Value function saved to strategic.value.pkl")
+        V_gpu = d_V_out.copy_to_host()
+        print(f"Step {t} completed.")
+
+    # Save the Value table
+    np.save("Strategic_value_table.npy", V_gpu)
+    print("Saved value table to 'Strategic_value_table.npy")
+
+    end_time = time.time()
+    print(f"Total running time for one loop: {end_time - start_time:.4f} s")
+
+    # Define a target state index (e.g. middle of the grid)
+    test_idx = (
+        len(X_REL_GRID) // 2 + 6,
+        len(Y_REL_GRID) // 2,
+        len(VEL_P_GRID) // 2,
+        len(VEL_V_GRID) // 2
+    )
+
+    # Re-run value computation to track V value at each step
+    V_gpu = np.zeros(shape, dtype=np.float32)
+    v_trace = []
+
+    for t in reversed(range(HORIZON)):
+        V_next = V_gpu.copy()
+        d_V_next = cuda.to_device(V_next)
+        d_V_out = cuda.to_device(V_gpu)
+
+        compute_value_kernel[blocks, threads](
+            d_V_next, d_V_out, 
+            d_X_REL, d_Y_REL, d_VEL_P, d_VEL_V,
+            d_ACT_P, d_ACT_V
+        )
+
+        V_gpu = d_V_out.copy_to_host()
+        v_trace.append(V_gpu[test_idx])
+
+    # Plot value evolution
+    import matplotlib.pyplot as plt
+    v_trace.reverse()  # To make time go from t=0 to t=HORIZON-1
+    plt.plot(range(HORIZON), v_trace, marker='o')
+    plt.title(f"Value evolution at state {test_idx}")
+    plt.xlabel("Time step t")
+    plt.ylabel("Value V")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":
